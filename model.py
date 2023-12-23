@@ -45,9 +45,9 @@ class GaussianModel:
         scales = np.repeat(log_mean_dist[:, np.newaxis], 3, axis=1)
         self.scales = Tensor(scales, requires_grad=True)
 
-        rotations = np.zeros((num_points, 4))
-        rotations[:, 3] = 1.0
-        self.rotations = Tensor(rotations, requires_grad=True)
+        quats = np.zeros((num_points, 4))
+        quats[:, 3] = 1.0
+        self.quats = Tensor(quats, requires_grad=True)
         self.opacities = logit(0.1 * Tensor.ones(num_points, 1, requires_grad=True))
         self.grad_norm = Tensor.empty(num_points, 3, requires_grad=False)
 

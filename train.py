@@ -15,7 +15,7 @@ def train(dataset: Dataset):
     device = CUDADevice("cuda:0")
 
     model = GaussianModel(sh_degree=3, pcd=dataset.pcd)
-    rasterizer = GaussianRasterizer(model, dataset.cameras, device)
+    rasterizer = GaussianRasterizer(model, dataset.cameras)
     scene = Scene(dataset.cameras, model, rasterizer)
     optimizer = optim.Adam(get_parameters(model), lr=1e-3)
 
