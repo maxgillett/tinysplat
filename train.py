@@ -14,9 +14,9 @@ from scene import Scene
 def train(dataset: Dataset):
     device = CUDADevice("cuda:0")
 
-    model = GaussianModel(sh_degree=3)
+    model = GaussianModel(sh_degree=3, pcd=dataset.pcd)
     rasterizer = GaussianRasterizer(model, dataset.cameras, device)
-    scene = Scene(dataset, model)
+    scene = Scene(dataset.cameras, model, rasterizer)
     optimizer = optim.Adam(get_parameters(model), lr=1e-3)
 
     file_name = "gaussian.bin"
@@ -24,10 +24,12 @@ def train(dataset: Dataset):
         model.load(file_name)
 
     for step in range(1000):
+        print("step", step)
+
         # 1. Update the learning rate of the gaussians
         # 2. Every N iterations, increase the spherical harmonic degree by one
-        model.update_learning_rate(optimizer, iteration)
-        if iteration % 10 == 0:
+        model.update_learning_rate(optimizer, step)
+        if step % 10 == 0:
             model.increment_sh_degree()
 
         # 3. Pick a random camera from the scene and render the viewpoint
@@ -49,7 +51,7 @@ def train(dataset: Dataset):
         optimizer.zero_grad()
 
         # 8. Every M iterations, save checkpoint
-        if iteration % 100 == 0:
+        if step % 100 == 0:
             model.save(file_name)
 
 if __name__ == "__main__":

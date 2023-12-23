@@ -5,7 +5,7 @@ import numpy as np
 import pycolmap
 from tinygrad import Tensor
 
-from scene import Camera
+from scene import Camera, PointCloud
 
 class Dataset:
     def __init__(self, colmap_path: str, images_path: str):
@@ -19,7 +19,7 @@ class Dataset:
 
         # Construct cameras
         self.cameras = []
-        for img in images:
+        for img in images[:2]:
             image_path = os.path.join(images_path, img.name)
             image_name = os.path.basename(img.name)
             image = Image.open(image_path)
@@ -57,7 +57,7 @@ class Dataset:
         points = []
         colors = []
         for pt in points_3d:
-            points.append(Tensor(pt.xyz))
-            colors.append(Tensor(pt.color))
-        self.pcd = Tensor(points, colors)
+            points.append(pt.xyz)
+            colors.append(pt.color)
+        self.pcd = PointCloud(points=Tensor(np.asarray(points)), colors=Tensor(np.asarray(colors)))
 
