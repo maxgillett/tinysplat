@@ -1,8 +1,8 @@
+import torch
 import numpy as np
-from tinygrad.tensor import Tensor
-from tinygrad.helpers import dtypes
-from tinygrad.nn.state import get_parameters
-from tinygrad.runtime.ops_cuda import CUDADevice
+from torch import Tensor
+from torch import dtype as dtypes
+from torch import device as CUDADevice
 from sklearn.neighbors import NearestNeighbors
 
 from scene import PointCloud
@@ -29,12 +29,12 @@ class GaussianModel:
         num_points = pcd.points.shape[0]
         dim_sh = num_sh_bases(sh_degree)
 
-        self.means = Tensor(np.stack(pcd.points.numpy(), axis=0), dtype=dtypes.float32, requires_grad=True)
+        self.means = torch.tensor(np.stack(pcd.points.numpy(), axis=0), dtype=torch.float32, requires_grad=True)
 
         # Initialize colors (with spherical harmonics)
         colors = np.zeros((num_points, dim_sh, 3))
         colors[:, 0, :] = np.stack(pcd.colors.numpy(), axis=0)
-        self.colors = Tensor(colors, requires_grad = True)
+        self.colors = torch.tensor(colors, requires_grad = True)
 
         # Find the average of the three nearest neighbors for each point and 
         # use that as the scale
@@ -43,13 +43,13 @@ class GaussianModel:
         distances, indices = nn.kneighbors(pcd.points.numpy())
         log_mean_dist = np.log(np.mean(distances[:, 1:], axis=1))
         scales = np.repeat(log_mean_dist[:, np.newaxis], 3, axis=1)
-        self.scales = Tensor(scales, requires_grad=True)
+        self.scales = torch.tensor(scales, requires_grad=True)
 
         quats = np.zeros((num_points, 4))
         quats[:, 3] = 1.0
-        self.quats = Tensor(quats, requires_grad=True)
-        self.opacities = logit(0.1 * Tensor.ones(num_points, 1, requires_grad=True))
-        self.grad_norm = Tensor.empty(num_points, 3, requires_grad=False)
+        self.quats = torch.tensor(quats, requires_grad=True)
+        self.opacities = logit(0.1 * torch.ones(num_points, 1, requires_grad=True))
+        self.grad_norm = torch.empty(num_points, 3, requires_grad=False)
 
     def increment_sh_degree(self):
         if self.active_sh_degree < self.max_sh_degree:
@@ -61,7 +61,7 @@ class GaussianModel:
 
     def densify_and_prune(self, transmittances: Tensor, visibilities: Tensor):
         # Update the gradients
-        norm = self.means.grad.square().sum(axis=1).sqrt()
+        norm = self.means.grad.pow(2).sum(dim=1).sqrt()
         print("grads", self.means.grad.numpy())
         #self.grad_norm[visibilities] += norm
 
@@ -74,10 +74,10 @@ class GaussianModel:
             cloned_opacities = self.opacities[idxs]
 
             # Extend tensors with cloned values
-            self.means = Tensor.cat(self.means, cloned_means, dim=0)
-            self.scales = Tensor.cat(self.scales, cloned_scales, dim=0)
-            self.rotations = Tensor.cat(self.rotations, cloned_rotations, dim=0)
-            self.opacities = Tensor.cat(self.opacities, cloned_opacities, dim=0)
+            self.means = torch.cat((self.means, cloned_means), dim=0)
+            self.scales = torch.cat((self.scales, cloned_scales), dim=0)
+            self.rotations = torch.cat((self.rotations, cloned_rotations), dim=0)
+            self.opacities = torch.cat((self.opacities, cloned_opacities), dim=0)
 
         # TODO: Split Gaussians
         #stds = self.scales.exp()[idxs].repeat([2, 1])
@@ -92,16 +92,16 @@ class GaussianModel:
 
     def load(self, path: str):
         with open(filename+'.npy', 'rb') as f:
-            for par in get_parameters(self):
+            for name, par in self.named_parameters():
                 try:
-                    par.numpy()[:] = np.load(f)
-                    if GPU:
-                        par.gpu()
+                    par.data = torch.from_numpy(np.load(f))
+                    if torch.cuda.is_available():
+                        par.data = par.data.to('cuda')
                 except:
                     print('Could not load parameter')
 
 
     def save(self, path: str):
         with open(filename+'.npy', 'wb') as f:
-            for par in get_parameters(self):
-                np.save(f, par.numpy())
+            for name, par in self.named_parameters():
+                np.save(f, par.data.cpu().numpy())
