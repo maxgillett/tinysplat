@@ -3,3 +3,4 @@
 .stignore
 datasets
 splats
+viewer/node_modules
