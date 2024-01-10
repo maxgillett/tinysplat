@@ -1,3 +1,6 @@
+.DS_Store
 .aider*
 .stignore
 datasets
+splats
+viewer/node_modules

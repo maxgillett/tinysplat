@@ -3,14 +3,20 @@ import os
 from PIL import Image
 import numpy as np
 import pycolmap
-from tinygrad import Tensor
+import torch
+from torch import tensor
+import viser.transforms as vtf
 
-from scene import Camera, PointCloud
+from .scene import Camera, PointCloud
 
 class Dataset:
-    def __init__(self, colmap_path: str, images_path: str):
+    def __init__(self,
+        colmap_path: str,
+        images_path: str,
+        max_image_dimension: int = 512,
+        device = "cuda:0",
+    ):
         """Load a dataset from a COLMAP reconstruction."""
-        # TODO: Move to a "from_colmap" constructor
 
         reconstruction = pycolmap.Reconstruction(colmap_path)
         cameras = reconstruction.cameras
@@ -19,7 +25,7 @@ class Dataset:
 
         # Construct cameras
         self.cameras = []
-        for img in images[:2]:
+        for img in images[:]:
             image_path = os.path.join(images_path, img.name)
             image_name = os.path.basename(img.name)
             image = Image.open(image_path)
@@ -29,16 +35,18 @@ class Dataset:
 
             # Focal length and field of view
             cam = cameras[img.camera_id]
-            f = cam.params[0] # focal length
-            fov_x = 2 * np.arctan(image.width / (2 * f))
-            fov_y = 2 * np.arctan(image.height / (2 * f))
+            f_x = cam.focal_length_x
+            f_y = cam.focal_length_y
+            fov_x = 2 * np.arctan(image.width / f_x)
+            fov_y = 2 * np.arctan(image.height / f_y)
 
             # View matrix (note that inv(view_mat)[:3,3] == position)
+            rot_mat = img.rotation_matrix()
             view_mat = np.zeros((4,4))
-            view_mat[:3, :3] = img.rotation_matrix()
+            view_mat[:3, :3] = rot_mat
             view_mat[:3, 3] = img.tvec
             view_mat[3, 3] = 1
-            view_mat = Tensor(view_mat)
+            view_mat = tensor(view_mat, dtype=torch.float32)
 
             # Projection matrix
             znear, zfar = 0.001, 1000
@@ -48,16 +56,22 @@ class Dataset:
             proj_mat[2, 2] = (zfar + znear) / (zfar - znear)
             proj_mat[2, 3] = -1. * zfar * znear / (zfar - znear)
             proj_mat[3, 2] = 1
-            proj_mat = Tensor(proj_mat)
+            proj_mat = tensor(proj_mat, dtype=torch.float32)
 
-            camera = Camera(position, view_mat, proj_mat, fov_x, fov_y, image, name=image_name)
+            camera = Camera(
+                position=position, 
+                view_matrix=view_mat,
+                proj_matrix=proj_mat,
+                fov_x=fov_x,
+                fov_y=fov_y,
+                image=image,
+                name=image_name, device=device)
             self.cameras.append(camera)
 
         # Construct point cloud
-        points = []
-        colors = []
-        for pt in points_3d:
-            points.append(pt.xyz)
-            colors.append(pt.color)
-        self.pcd = PointCloud(points=Tensor(np.asarray(points)), colors=Tensor(np.asarray(colors)))
+        self.pcd = PointCloud(
+            points=torch.as_tensor(
+                np.asarray([pt.xyz for pt in points_3d]), device=device),
+            colors=torch.as_tensor(
+                np.asarray([pt.color for pt in points_3d]), device=device))
 
