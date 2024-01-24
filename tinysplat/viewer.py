@@ -54,13 +54,11 @@ class Viewer:
         await self.server.wait_closed()
 
     async def handle_message(self, client, message):
-        print("Got message: ", message)
         msg = json.loads(message)
 
         if msg["type"] == "cameraInfo":
             # Duplicate a camera from the scene, unless a new one is provided
             camera = copy.copy(self.scene.cameras[0])
-            camera.rescale(4)
             client.camera = camera
             await self.async_queue.put((client, msg))
         elif msg["type"] == "renderRequest":
@@ -70,23 +68,25 @@ class Viewer:
             await self.async_queue.put((client, msg))
 
     async def process_async_queue(self):
-        print("Processing async queue")
         while True:
             client, msg = await self.async_queue.get()
 
             # Update the view matrix
             position = torch.as_tensor(msg["position"], dtype=torch.float32)
             quat = np.asarray(msg["quat"], dtype=np.float32)
+            cam = client.camera
             client.camera.update_view_matrix(position, quat)
 
             # Render a frame
             with torch.no_grad():
-                img = self.scene.render(client.camera).detach().cpu().numpy()
+                self.scene.model.background = torch.zeros(3, device=self.device)
+                img, extras = self.scene.render(client.camera)
+                img = img.detach().cpu().numpy()
             img = img * 255
 
             # Render at 10fps. This should be tuned to network latency
             await client.send_image(img)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.02)
 
     def stop(self):
         self.server.close()
