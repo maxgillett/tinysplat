@@ -10,13 +10,12 @@ Tinysplat is a minimal [3D Gaussian splatting](https://arxiv.org/abs/2308.04079)
 
 2. Start the training procedure:
 
-`LOG_LEVEL=DEBUG python scripts/train.py --train --regularize-depth --dataset-dir=datasets/truck`
+    `LOG_LEVEL=DEBUG python scripts/train.py --train --regularize-depth --dataset-dir=datasets/truck`
 
-A full list of the available options can be displayed with `python scripts/train.py --help`.
+    A full list of the available options can be displayed with `python scripts/train.py --help`.
 
 3. View the scene during training with a freely moving camera by launching the viewer:
 
-`cd viewer`
-`npx vite`
+    `cd viewer; npx vite`
 
-You can now navigate to `http://localhost:5173`, using the WASD+QE keys and mouse to explore.
+    You can now navigate to `http://localhost:5173`, using the WASD+QE keys and mouse to explore.
