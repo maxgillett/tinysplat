@@ -121,8 +121,7 @@ controls.addEventListener('change', () => {
   sendCameraTransform();
 })
 
-
-
 // Default listeners
 document.addEventListener('mousedown', lockControls);
 document.addEventListener('mouseup', unlockControls);
+

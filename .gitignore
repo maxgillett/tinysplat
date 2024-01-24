@@ -4,3 +4,5 @@
 datasets
 splats
 viewer/node_modules
+notebooks
+*/__pycache__
