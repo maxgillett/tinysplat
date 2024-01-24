@@ -66,8 +66,7 @@ async def train(
         # 7. Densify and prune
         with torch.no_grad():
             model.update_grad_accum(step, extras)
-            #model.densify_and_prune(step, optimizer, extras)
-            #model.reset_opacities(step)
+            model.densify_and_prune(step, optimizer, extras)
         optimizer.zero_grad(set_to_none=True)
 
         # Record and display metrics

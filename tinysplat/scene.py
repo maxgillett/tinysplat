@@ -67,8 +67,13 @@ class Camera:
             self.update_proj_matrix(fov_x, fov_y, near, far)
 
     def update_view_matrix(self, position: Tensor, quat):
-        # The translation vector (tvec) can be computed from the rotation matrix
-        # R and camera position p according to: -R^T \cdot p
+        """
+        View matrix (world to camera transform)
+
+        The translation vector (tvec) can be computed from the rotation matrix
+        R and camera position p according to: -R^T \cdot p.
+        Note that inv(view_mat)[:3,3] == position.
+        """
         rot_mat = quat_to_rot_matrix(quat)
         view_mat = np.zeros((4,4))
         view_mat[:3, :3] = rot_mat
@@ -78,7 +83,6 @@ class Camera:
         self.view_matrix = view_mat
 
     def update_proj_matrix(self, fov_x: float, fov_y: float, znear: float = 0.001, zfar: float = 1000):
-        # TODO: Confirm correct
         self.fov_x = fov_x
         self.fov_y = fov_y
         proj_mat = np.zeros((4,4))
@@ -88,16 +92,6 @@ class Camera:
         proj_mat[2, 3] = -1. * zfar * znear / (zfar - znear)
         proj_mat[3, 2] = 1
         self.proj_matrix = torch.as_tensor(proj_mat, dtype=torch.float32)
-
-        #self.fov_x = fov_x
-        #self.fov_y = fov_y
-        #proj_mat = np.zeros((4,4))
-        #proj_mat[0, 0] = 2 * self.f_x / self.width
-        #proj_mat[1, 1] = 2 * self.f_y / self.height
-        #proj_mat[2, 2] = (zfar + znear) / (zfar - znear)
-        #proj_mat[2, 3] = -2. * zfar * znear / (zfar - znear)
-        #proj_mat[3, 2] = 1
-        #self.proj_matrix = torch.as_tensor(proj_mat, dtype=torch.float32)
 
     def rescale(self, factor: float):
         self.width = int(self.width * factor)
