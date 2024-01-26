@@ -42,8 +42,20 @@ class Dataset:
             else:
                 f_x = cam.focal_length
                 f_y = cam.focal_length
-            fov_x = 2 * np.arctan(image.width / f_x)
-            fov_y = 2 * np.arctan(image.height / f_y)
+
+            # Compare image width to cam width, and adjust focal length accordingly
+            if len(cam.principal_point_idxs()) == 2:
+                c_x = cam.principal_point_x 
+                c_y = cam.principal_point_y
+            else:
+                c_x = cam.principal_point
+                c_y = cam.principal_point
+            f_x *= image.width / 2 / c_x
+            f_y *= image.height / 2 / c_y
+
+            # Compute field of view
+            fov_x = 2 * np.arctan(image.width / (2 * f_x))
+            fov_y = 2 * np.arctan(image.height / (2 * f_y))
 
             # 3D points visible in this image
             visible_point_ids = torch.as_tensor([p.point3D_id for p in img.points2D if p.has_point3D()], device=device)

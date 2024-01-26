@@ -1,4 +1,5 @@
 import os, logging
+from typing import Optional
 
 import torch
 import numpy as np
@@ -9,18 +10,23 @@ from torch.nn.parameter import Parameter
 from torchmetrics.image import PeakSignalNoiseRatio
 from pytorch_msssim import SSIM
 from sklearn.neighbors import NearestNeighbors
-from gsplat.sh import num_sh_bases
+from gsplat.sh import num_sh_bases, deg_from_sh
+from plyfile import PlyData, PlyElement
 
 from .scene import PointCloud
 from .utils import random_quat_tensor, RGB2SH, SH2RGB
 
 class GaussianModel(nn.Module):
     def __init__(self,
-        pcd: PointCloud,
+        num_points: Optional[int] = None,
         device = device("cuda:0"),
         **kwargs
     ):
         super(GaussianModel, self).__init__()
+        self.device = device
+
+        if not kwargs.get('train', False): return
+        assert num_points is not None, "Number of points must be specified for training"
 
         # Configuration
         self.max_sh_degree = kwargs['sh_degree']
@@ -28,7 +34,6 @@ class GaussianModel(nn.Module):
         self.epsilon_alpha = kwargs['epsilon_alpha']
         self.tau_means = kwargs['tau_means']
         self.phi = kwargs['phi']
-        self.device = device
 
         # Learning rates
         self.lr_means = kwargs['lr_means']
@@ -48,47 +53,57 @@ class GaussianModel(nn.Module):
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = SSIM(data_range=1.0, size_average=True, channel=3)
 
-        dim_sh = num_sh_bases(self.max_sh_degree)
         self.background = torch.zeros(3, device=device)
-
-        self.filepath = os.path.join(kwargs['splat_dir'], kwargs['splat_filename'])
-        if os.path.exists(self.filepath):
-            state_dict = torch.load(self.filepath)
-            num_points = state_dict['means'].shape[0]
-
-            self.means = Parameter(torch.zeros(num_points, 3, device=device))
-            self.colors_dc = Parameter(torch.zeros(num_points, 3, device=device))
-            self.colors_rest = Parameter(torch.zeros(num_points, dim_sh - 1, 3, device=device))
-            self.scales = Parameter(torch.zeros(num_points, 3, device=device))
-            self.quats = Parameter(torch.zeros(num_points, 4, device=device))
-            self.opacities = Parameter(torch.zeros(num_points, 1, device=device))
-
-            self.load_state_dict(state_dict)
-        else:
-            # Initialize colors (using spherical harmonics)
-            num_points = pcd.xyz.shape[0]
-            colors = torch.zeros((num_points, dim_sh, 3), dtype=torch.float32)
-            colors[:, 0, :] = RGB2SH(pcd.colors / 255)
-
-            # Find the average of the three nearest neighbors for each point and 
-            # use that as the scale
-            nn = NearestNeighbors(n_neighbors=4, algorithm='auto', metric='euclidean')
-            nn = nn.fit(pcd.xyz.cpu().numpy())
-            distances, indices = nn.kneighbors(pcd.xyz.cpu().numpy())
-            log_mean_dist = np.log(np.mean(distances[:, 1:], axis=1).astype(np.float32))
-            scales = np.repeat(log_mean_dist[:, np.newaxis], 3, axis=1)
-
-            # Differentiable model parameters
-            self.means = Parameter(pcd.xyz.float())
-            self.colors_dc = Parameter(colors[:, 0, :])
-            self.colors_rest = Parameter(colors[:, 1:, :])
-            self.scales = Parameter(torch.as_tensor(scales, device=device))
-            self.quats = Parameter(random_quat_tensor(num_points))
-            self.opacities = Parameter(torch.logit(0.1 * torch.ones(num_points, 1, device=device)))
 
         # Accumulate the 'means' gradients for use in cloning/splitting/pruning
         self.means_grad_accum = torch.zeros(num_points, device=device).float()
 
+    @classmethod
+    def from_pcd(cls, pcd: PointCloud, **kwargs):
+        num_points = pcd.xyz.shape[0]
+        model = cls(num_points, **kwargs)
+
+        # Initialize colors (using spherical harmonics)
+        dim_sh = num_sh_bases(model.max_sh_degree)
+        colors = torch.zeros((num_points, dim_sh, 3), dtype=torch.float32)
+        colors[:, 0, :] = RGB2SH(pcd.colors / 255)
+
+        # Find the average of the three nearest neighbors for each point and 
+        # use that as the scale
+        nn = NearestNeighbors(n_neighbors=4, algorithm='auto', metric='euclidean')
+        nn = nn.fit(pcd.xyz.cpu().numpy())
+        distances, indices = nn.kneighbors(pcd.xyz.cpu().numpy())
+        log_mean_dist = np.log(np.mean(distances[:, 1:], axis=1).astype(np.float32))
+        scales = np.repeat(log_mean_dist[:, np.newaxis], 3, axis=1)
+
+        # Differentiable model parameters
+        model.means = Parameter(pcd.xyz.float())
+        model.colors_dc = Parameter(colors[:, 0, :])
+        model.colors_rest = Parameter(colors[:, 1:, :])
+        model.scales = Parameter(torch.as_tensor(scales, device=model.device))
+        model.quats = Parameter(random_quat_tensor(num_points))
+        model.opacities = Parameter(torch.logit(0.1 * torch.ones(num_points, 1, device=model.device)))
+        return model
+
+    @classmethod
+    def from_state_checkpoint(cls, state_dict, **kwargs):
+        num_points = state_dict['means'].shape[0]
+        dim_sh = state_dict['colors_rest'].shape[1]
+        model = cls(num_points, **kwargs)
+        device = model.device
+
+        model.means = Parameter(torch.zeros(num_points, 3, device=device))
+        model.colors_dc = Parameter(torch.zeros(num_points, 3, device=device))
+        model.colors_rest = Parameter(torch.zeros(num_points, dim_sh, 3, device=device))
+        model.scales = Parameter(torch.zeros(num_points, 3, device=device))
+        model.quats = Parameter(torch.zeros(num_points, 4, device=device))
+        model.opacities = Parameter(torch.zeros(num_points, 1, device=device))
+
+        model.max_sh_degree = deg_from_sh(dim_sh + 1)
+        model.active_sh_degree = model.max_sh_degree
+
+        model.load_state_dict(state_dict)
+        return model
 
     def parameters(self):
         return [
@@ -195,12 +210,47 @@ class GaussianModel(nn.Module):
             state["exp_avg"] = torch.cat((state["exp_avg"], new_exp_avg))
             state["exp_avg_sq"] = torch.cat((state["exp_avg_sq"], new_exp_avg_sq))
 
-            # Replace paramater in optimizer state and model 
+            # Replace parameter in optimizer state and model 
             del optim.state[group["params"][0]]
             group["params"][0] = Parameter(param)
             optim.state[group["params"][0]] = state
             setattr(self, name, group["params"][0])
-            setattr(self, "test_value", step)
 
         # Reset accumulated gradients
         self.means_grad_accum = torch.zeros(self.means.shape[0], device=self.device)
+
+    def export_ply(self, filepath):
+        # Build data type
+        attrs = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+        for i in range(np.prod(self.colors_dc.shape[1:])):
+            attrs.append('f_dc_{}'.format(i))
+        for i in range(np.prod(self.colors_rest.shape[1:])):
+            attrs.append('f_rest_{}'.format(i))
+        attrs.append('opacity')
+        for i in range(self.scales.shape[1]):
+            attrs.append('scale_{}'.format(i))
+        for i in range(self.quats.shape[1]):
+            attrs.append('rot_{}'.format(i))
+        obj_dtype = [(attr, 'f4') for attr in attrs]
+
+        # Prepare data
+        means = self.means.detach().cpu().numpy()
+        normals = np.zeros_like(means)
+        colors_dc = self.colors_dc.detach()[:,None,:].transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        colors_rest = self.colors_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        opacities = self.opacities.detach().cpu().numpy()
+        scales = self.scales.detach().cpu().numpy()
+        quats = self.quats.detach().cpu().numpy()
+
+        # Concatenate data and create PLY object
+        elements = np.empty(means.shape[0], dtype=obj_dtype)
+        attributes = np.concatenate((means, normals, colors_dc, colors_rest, opacities, scales, quats), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, 'vertex')
+
+        # Write binary PLY file
+        with open(filepath, 'wb') as f:
+            PlyData([el]).write(f)
+
+    def export_splat(self, filepath):
+        raise NotImplementedError

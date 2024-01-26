@@ -61,8 +61,6 @@ class GaussianRasterizer:
         img_width, img_height = dims
         c_x = img_width / 2
         c_y = img_height / 2
-        fov_x = camera.fov_x
-        fov_y = camera.fov_y
         view_matrix = camera.view_matrix.to(self.device)
         proj_matrix = camera.proj_matrix.to(self.device)
         scales = torch.exp(model.scales)

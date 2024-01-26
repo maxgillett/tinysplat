@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { PointerLockControls } from './PointerLockControls.js';
+//import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 
 // Create a websocket connection to the server
 const socket = new WebSocket('ws://localhost:8765');

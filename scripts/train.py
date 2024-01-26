@@ -1,4 +1,5 @@
 import sys, asyncio, logging
+from datetime import datetime
 from argparse import ArgumentParser, BooleanOptionalAction
 from collections import defaultdict
 
@@ -24,6 +25,9 @@ async def train(
     device = args.device
     metrics = Metrics(model, scene, args)
     optimizer = optim.Adam(model.parameters())
+
+    # Checkpoint filepath
+    timestamp = datetime.now().strftime('%Y_%m_%d-%H_%M_%S')
 
     for step in tqdm(range(1, args.max_iter)):
         # TODO: Rescale scene at desired steps
@@ -78,9 +82,10 @@ async def train(
             metrics.update(step, 'Loss (depth)', loss_depth.detach().cpu().numpy())
         metrics.log(step)
 
-        # 8. Every M iterations, save checkpoint
-        if model.filepath is not None and step % args.checkpoint_interval == 0:
-            torch.save(model.state_dict(), model.filepath)
+        # 8. Every M iterations, save checkpoint (the filename should be the current date + step
+        if args.save_checkpoints and step % args.checkpoint_interval == 0:
+            filepath = f'{args.checkpoint_dir}/{timestamp}-{step}.pth'
+            torch.save(model.state_dict(), filepath)
 
         # Yield control back to the event loop
         if args.viewer: await asyncio.sleep(0)
@@ -113,8 +118,9 @@ def arg_parser():
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--train', action=BooleanOptionalAction)
     parser.add_argument('--viewer', type=bool, default=True)
-    parser.add_argument('--splat-dir', type=str, default='splats')
-    parser.add_argument('--splat-filename', type=str, default='model.splat')
+    parser.add_argument('--load-checkpoint', type=str)
+    parser.add_argument('--save-checkpoints', action=BooleanOptionalAction)
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
     parser.add_argument('--sh-degree', type=int, default=3)
     parser.add_argument('--max-iter', type=int, default=10_000)
     parser.add_argument('--sh-increment-interval', type=int, default=500)
@@ -165,6 +171,7 @@ def arg_parser():
 
     return parser
 
+
 async def main():
     logging.basicConfig(
         level=logging.DEBUG,
@@ -182,9 +189,16 @@ async def main():
         colmap_path=args.colmap_path,
         images_path=args.images_path,
         device=device)
-    model = GaussianModel(
-        pcd=dataset.pcd,
-        **vars(args)).to(device)
+
+    if filepath := args.load_checkpoint:
+        state_dict = torch.load(filepath)
+        model = GaussianModel.from_state_checkpoint(
+            state_dict,
+            **vars(args)).to(device)
+    else:
+        model = GaussianModel.from_pcd(
+            dataset.pcd,
+            **vars(args)).to(device)
     rasterizer = GaussianRasterizer(model, dataset.cameras)
     scene = Scene(dataset.cameras, model, rasterizer)
 
@@ -200,6 +214,7 @@ async def main():
         coroutines.append(train(model, scene, args))
 
     await asyncio.gather(*coroutines)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

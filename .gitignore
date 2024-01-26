@@ -2,7 +2,8 @@
 .aider*
 .stignore
 datasets
-splats
+checkpoints
 viewer/node_modules
 notebooks
+output
 */__pycache__
