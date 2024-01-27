@@ -167,7 +167,7 @@ def arg_parser():
     # Depth estimation
     parser_depth = parser.add_argument_group('Depth estimation')
     parser_depth.add_argument('--depths-path', type=str, default='depths')
-    parser_depth.add_argument('--midas-model-type', type=str, default='MiDaS_small')
+    parser_depth.add_argument('--depth-model', type=str, default='zoe')
 
     return parser
 

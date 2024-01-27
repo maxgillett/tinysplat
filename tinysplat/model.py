@@ -64,7 +64,7 @@ class GaussianModel(nn.Module):
         model = cls(num_points, **kwargs)
 
         # Initialize colors (using spherical harmonics)
-        dim_sh = num_sh_bases(model.max_sh_degree)
+        dim_sh = num_sh_bases(kwargs['sh_degree'])
         colors = torch.zeros((num_points, dim_sh, 3), dtype=torch.float32)
         colors[:, 0, :] = RGB2SH(pcd.colors / 255)
 
