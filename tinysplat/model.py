@@ -14,7 +14,7 @@ from gsplat.sh import num_sh_bases, deg_from_sh
 from plyfile import PlyData, PlyElement
 
 from .scene import PointCloud
-from .utils import random_quat_tensor, RGB2SH, SH2RGB
+from .utils import random_quat_tensor, quat_to_rot_tensor, RGB2SH, SH2RGB
 
 class GaussianModel(nn.Module):
     def __init__(self,
@@ -48,6 +48,7 @@ class GaussianModel(nn.Module):
         self.warmup_grad = kwargs['warmup_grad']
         self.interval_densify = kwargs['interval_densify']
         self.interval_opacity_reset = kwargs['interval_opacity_reset']
+        self.densify_scale_thresh = kwargs['densify_scale_thresh']
 
         # Quality metrics
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
@@ -134,25 +135,18 @@ class GaussianModel(nn.Module):
         if step < self.warmup_densify or step % self.interval_densify != 0:
             return
 
+        # FIXME: Temporarily limit number of Gaussians to 250k
+        if self.means.shape[0] > 250000:
+            return
+
         width = extras['camera']['width']
         height = extras['camera']['height']
         grad_norm_avg = self.means_grad_accum / self.interval_densify / 2 * max(width, height)
         grad_mask = grad_norm_avg >= self.tau_means
 
-        # Prune Gaussians with low opacity
-        prune_mask = (torch.sigmoid(self.opacities) > self.epsilon_alpha).squeeze()
-        logging.debug("Pruned {} Gaussians".format((~prune_mask).sum()))
-
-        # Temporarily limit number of Gaussians to 150k
-        global_mask = torch.ones(self.means.shape[0]).bool().to(self.device)
-        if prune_mask.sum() > 150000:
-            global_mask[:] = False
-
-        # Clone Gaussians, and move them in the direction of the gradient
-        mask = self.scales.exp().max(dim=-1).values < 0.01
-        mask &= prune_mask
+        # Clone Gaussians (TODO: move them in the direction of the gradient)
+        mask = self.scales.exp().max(dim=-1).values < self.densify_scale_thresh
         mask &= grad_mask
-        mask &= global_mask
         cloned_means = self.means[mask]
         cloned_means = cloned_means
         cloned_colors_dc = self.colors_dc[mask]
@@ -162,18 +156,24 @@ class GaussianModel(nn.Module):
         cloned_opacities = self.opacities[mask]
         logging.debug("Cloned {} Gaussians".format(mask.sum()))
 
-        # Split Gaussians (TODO: Sample from distribution)
-        mask = self.scales.exp().max(dim=-1).values > 0.01
-        mask &= prune_mask
-        mask &= grad_mask
-        mask &= global_mask
-        split_means = self.means[mask]
-        split_colors_dc = self.colors_dc[mask]
-        split_colors_rest = self.colors_rest[mask]
-        split_scales = torch.log(torch.exp(self.scales[mask]) / self.phi)
-        split_quats = self.quats[mask]
-        split_opacities = self.opacities[mask]
-        logging.debug("Split {} Gaussians".format(mask.sum()))
+        # Split Gaussians by sampling from a distribution
+        split_mask = self.scales.exp().max(dim=-1).values > self.densify_scale_thresh
+        split_mask &= grad_mask
+        dist = GaussianDistribution(self, split_mask)
+        samples = dist.sample(n_samples=2)
+        split_means = samples['means']
+        split_colors_dc = samples['colors_dc']
+        split_colors_rest = samples['colors_rest']
+        split_scales = samples['scales']
+        split_quats = samples['quats']
+        split_opacities = samples['opacities']
+        logging.debug("Split {} Gaussians".format(split_mask.sum()))
+
+        # Prune low opacity and large scale Gaussians marked for splitting
+        prune_mask = (torch.sigmoid(self.opacities) > 0.1).squeeze()
+        prune_mask &= torch.exp(self.scales).max(dim=-1).values < 0.5
+        prune_mask &= split_mask
+        logging.debug("Pruned {} Gaussians".format(prune_mask.sum()))
 
         # Concatenate all newly created parameters
         new_means = torch.cat((cloned_means, split_means))
@@ -187,12 +187,12 @@ class GaussianModel(nn.Module):
         # We do this instead of creating a new optimizer because we want to
         # keep the momentum information.
         params = {
-            "means": (self.means[prune_mask, ...], new_means),
-            "colors_dc": (self.colors_dc[prune_mask, ...], new_colors_dc),
-            "colors_rest": (self.colors_rest[prune_mask, ...], new_colors_rest),
-            "scales": (self.scales[prune_mask, ...], new_scales),
-            "quats": (self.quats[prune_mask, ...], new_quats),
-            "opacities": (self.opacities[prune_mask, ...], new_opacities),
+            "means": (self.means[~prune_mask, ...], new_means),
+            "colors_dc": (self.colors_dc[~prune_mask, ...], new_colors_dc),
+            "colors_rest": (self.colors_rest[~prune_mask, ...], new_colors_rest),
+            "scales": (self.scales[~prune_mask, ...], new_scales),
+            "quats": (self.quats[~prune_mask, ...], new_quats),
+            "opacities": (self.opacities[~prune_mask, ...], new_opacities),
         }
         for group in optim.param_groups:
             name = group["name"]
@@ -201,8 +201,8 @@ class GaussianModel(nn.Module):
 
             # Mask internal state variables
             state = optim.state[group["params"][0]]
-            state["exp_avg"] = state["exp_avg"][prune_mask, ...]
-            state["exp_avg_sq"] = state["exp_avg_sq"][prune_mask, ...]
+            state["exp_avg"] = state["exp_avg"][~prune_mask, ...]
+            state["exp_avg_sq"] = state["exp_avg_sq"][~prune_mask, ...]
 
             # Concatenate interval state variables
             new_exp_avg = torch.zeros_like(new_param)
@@ -254,3 +254,44 @@ class GaussianModel(nn.Module):
 
     def export_splat(self, filepath):
         raise NotImplementedError
+
+class GaussianDistribution:
+    def __init__(self, model, mask):
+        self.model = model
+        self.mask = mask
+        self.means = model.means[mask]
+        self.scales = model.scales[mask]
+        self.quats = model.quats[mask]
+        self.colors_dc = model.colors_dc[mask]
+        self.colors_rest = model.colors_rest[mask]
+        self.opacities = model.opacities[mask]
+
+    def sample(self, n_samples=2):
+        device = self.means.device
+
+        # Perturb the means
+        n_splits = self.means.shape[0]
+
+        if n_splits > 0:
+            mean_pert = torch.normal(
+                mean=torch.zeros(n_splits * n_samples, 3, device=device),
+                std=torch.exp(self.scales.repeat(n_samples, 1))).to(device)
+            rots = quat_to_rot_tensor(self.quats.repeat(n_samples, 1))
+            split_means = torch.bmm(rots, mean_pert[..., None]).squeeze() + self.means.repeat(n_samples, 1)
+            split_scales = torch.log(torch.exp(self.scales.repeat(n_samples, 1)) / 1.6)
+            self.model.scales[self.mask] = torch.log(torch.exp(self.scales) / 1.6)
+        else:
+            split_means = self.means.repeat(n_samples, 1)
+            split_scales = self.scales.repeat(n_samples, 1)
+
+        samples = {
+            "means": split_means,
+            "scales": split_scales,
+            "quats": self.quats.repeat(n_samples, 1),
+            "colors_dc": self.colors_dc.repeat(n_samples, 1),
+            "colors_rest": self.colors_rest.repeat(n_samples, 1, 1),
+            "opacities": self.opacities.repeat(n_samples, 1),
+        }
+
+        # Return samples
+        return samples

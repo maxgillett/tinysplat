@@ -2,6 +2,7 @@ import math
 import torch
 import numpy as np
 from torch import Tensor
+import torch.nn.functional as F
 
 def RGB2SH(rgb):
     C0 = 0.28209479177387814
@@ -36,3 +37,38 @@ def quat_to_rot_matrix(quat):
         [2*q1*q3 - 2*q2*q0, 2*q2*q3 + 2*q1*q0, 1 - 2*q1**2 - 2*q2**2]
     ])
     return R
+
+
+# Taken from gsplat
+def quat_to_rot_tensor(quat: Tensor) -> Tensor:
+    assert quat.shape[-1] == 4, quat.shape
+    w, x, y, z = torch.unbind(F.normalize(quat, dim=-1), dim=-1)
+    return torch.stack(
+        [
+            torch.stack(
+                [
+                    1 - 2 * (y**2 + z**2),
+                    2 * (x * y - w * z),
+                    2 * (x * z + w * y),
+                ],
+                dim=-1,
+            ),
+            torch.stack(
+                [
+                    2 * (x * y + w * z),
+                    1 - 2 * (x**2 + z**2),
+                    2 * (y * z - w * x),
+                ],
+                dim=-1,
+            ),
+            torch.stack(
+                [
+                    2 * (x * z - w * y),
+                    2 * (y * z + w * x),
+                    1 - 2 * (x**2 + y**2),
+                ],
+                dim=-1,
+            ),
+        ],
+        dim=-2,
+    )

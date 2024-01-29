@@ -101,7 +101,7 @@ class Metrics():
 
     def update(self, step, key, value):
         cam_idx = self.scene.camera_training_idxs[self.scene.current_camera_idx]
-        self.metrics[key][step // self.num_cameras + 1, cam_idx] = value
+        self.metrics[key][step // self.num_cameras, cam_idx] = value
 
     def log(self, step):
         if step % self.num_cameras != 0: return
@@ -151,7 +151,7 @@ def arg_parser():
     parser_lambda = parser.add_argument_group('Regularization')
     parser_lambda.add_argument('--regularize-depth', action=BooleanOptionalAction)
     parser_lambda.add_argument('--lambda-dssim', type=float, default=0.2)
-    parser_lambda.add_argument('--lambda-depth', type=float, default=0.1)
+    parser_lambda.add_argument('--lambda-depth', type=float, default=0.2)
     parser_lambda.add_argument('--lambda-smooth', type=float, default=0.2)
 
     # Gaussian densification
@@ -162,6 +162,7 @@ def arg_parser():
     parser_densify.add_argument('--interval-opacity-reset', type=int, default=3000)
     parser_densify.add_argument('--epsilon-alpha', type=float, default=0.005)
     parser_densify.add_argument('--tau-means', type=float, default=0.0002)
+    parser_densify.add_argument('--densify-scale-thresh', type=float, default=0.01)
     parser_densify.add_argument('--phi', type=float, default=1.6)
 
     # Depth estimation
