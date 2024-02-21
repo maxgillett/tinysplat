@@ -226,5 +226,3 @@ class MidasModel:
             ).squeeze()
         output = prediction.cpu().numpy()
         return output
-
-

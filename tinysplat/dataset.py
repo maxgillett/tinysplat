@@ -96,6 +96,11 @@ class Dataset:
                 device=device)
             self.cameras.append(camera)
 
+        # Compute camera extent
+        cam_positions = np.hstack([cam.position for cam in self.cameras])
+        mean_position = np.mean(cam_positions)
+        self.spatial_extent = np.max(np.linalg.norm(cam_positions - mean_position, axis=0)) * 1.1
+
         # Construct point cloud
         self.pcd = PointCloud(
             point_ids=torch.as_tensor(

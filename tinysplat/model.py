@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 import numpy as np
+from tqdm import tqdm
 from torch import nn, Tensor
 from torch import dtype as dtypes
 from torch import device
@@ -12,6 +13,7 @@ from pytorch_msssim import SSIM
 from sklearn.neighbors import NearestNeighbors
 from gsplat.sh import num_sh_bases, deg_from_sh
 from plyfile import PlyData, PlyElement
+from pytorch3d.ops import knn_points, ball_query
 
 from .scene import PointCloud
 from .utils import random_quat_tensor, quat_to_rot_tensor, RGB2SH, SH2RGB
@@ -47,6 +49,7 @@ class GaussianModel(nn.Module):
         self.warmup_densify = kwargs['warmup_densify']
         self.warmup_grad = kwargs['warmup_grad']
         self.interval_densify = kwargs['interval_densify']
+        self.densify_end = kwargs['densify_end']
         self.interval_opacity_reset = kwargs['interval_opacity_reset']
         self.densify_scale_thresh = kwargs['densify_scale_thresh']
 
@@ -116,12 +119,13 @@ class GaussianModel(nn.Module):
             {'params': [self.opacities], 'lr': self.lr_opacities, "name": "opacities"}
         ]
 
+    def update_learning_rate(self, step, optim):
+        # TODO
+        pass
+
     def increment_sh_degree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
-
-    def update_learning_rate(self, optimizer, step):
-        pass
 
     def update_grad_accum(self, step, extras):
         if step < self.warmup_grad: return
@@ -135,8 +139,11 @@ class GaussianModel(nn.Module):
         if step < self.warmup_densify or step % self.interval_densify != 0:
             return
 
-        # FIXME: Temporarily limit number of Gaussians to 250k
-        if self.means.shape[0] > 250000:
+        if step > self.densify_end:
+            return
+
+        # FIXME: Temporarily limit number of Gaussians
+        if self.means.shape[0] > 1000000:
             return
 
         width = extras['camera']['width']
@@ -170,29 +177,46 @@ class GaussianModel(nn.Module):
         logging.debug("Split {} Gaussians".format(split_mask.sum()))
 
         # Prune low opacity and large scale Gaussians marked for splitting
-        prune_mask = (torch.sigmoid(self.opacities) > 0.1).squeeze()
-        prune_mask &= torch.exp(self.scales).max(dim=-1).values < 0.5
-        prune_mask &= split_mask
+        # (we also prune the original "split" Gaussians, as we sampled twice above)
+        prune_mask = (torch.sigmoid(self.opacities) < 0.1).squeeze()
+        prune_mask &= torch.exp(self.scales).max(dim=-1).values > 0.5
+        prune_mask |= split_mask
         logging.debug("Pruned {} Gaussians".format(prune_mask.sum()))
 
-        # Concatenate all newly created parameters
-        new_means = torch.cat((cloned_means, split_means))
-        new_colors_dc = torch.cat((cloned_colors_dc, split_colors_dc))
-        new_colors_rest = torch.cat((cloned_colors_rest, split_colors_rest))
-        new_scales = torch.cat((cloned_scales, split_scales))
-        new_quats = torch.cat((cloned_quats, split_quats))
-        new_opacities = torch.cat((cloned_opacities, split_opacities))
+        # Concatenate all newly created tensors
+        tensors = dict()
+        tensors['means'] = torch.cat((cloned_means, split_means))
+        tensors['colors_dc'] = torch.cat((cloned_colors_dc, split_colors_dc))
+        tensors['colors_rest'] = torch.cat((cloned_colors_rest, split_colors_rest))
+        tensors['scales'] = torch.cat((cloned_scales, split_scales))
+        tensors['quats'] = torch.cat((cloned_quats, split_quats))
+        tensors['opacities'] = torch.cat((cloned_opacities, split_opacities))
+        self.update_state(optim, prune_mask, tensors)
 
-        # Replace optimizer state and parameters.
+        # Reset accumulated gradients
+        self.means_grad_accum = torch.zeros(self.means.shape[0], device=self.device)
+
+    def update_state(self, optim, mask, _tensors=dict()):
+        # If no tensors are provided (only a mask), we need to construct empty tensors
+        # of the appropriate shape and data type
+        def empty_tensor(param_name):
+            dtype = getattr(self, param_name).dtype
+            shape = getattr(self, param_name).shape
+            return (param_name, torch.empty((0, *shape[1:]), dtype=dtype).to(self.device))
+        tensors = dict([empty_tensor(name) for name in 
+            ['means', 'colors_dc', 'colors_rest', 'scales', 'quats', 'opacities']])
+        tensors.update(_tensors)
+
+        # Replace optimizer state and tensor parameters.
         # We do this instead of creating a new optimizer because we want to
-        # keep the momentum information.
+        # retain momentum information.
         params = {
-            "means": (self.means[~prune_mask, ...], new_means),
-            "colors_dc": (self.colors_dc[~prune_mask, ...], new_colors_dc),
-            "colors_rest": (self.colors_rest[~prune_mask, ...], new_colors_rest),
-            "scales": (self.scales[~prune_mask, ...], new_scales),
-            "quats": (self.quats[~prune_mask, ...], new_quats),
-            "opacities": (self.opacities[~prune_mask, ...], new_opacities),
+            "means": (self.means[~mask, ...], tensors['means']),
+            "colors_dc": (self.colors_dc[~mask, ...], tensors['colors_dc']),
+            "colors_rest": (self.colors_rest[~mask, ...], tensors['colors_rest']),
+            "scales": (self.scales[~mask, ...], tensors['scales']),
+            "quats": (self.quats[~mask, ...], tensors['quats']),
+            "opacities": (self.opacities[~mask, ...], tensors['opacities']),
         }
         for group in optim.param_groups:
             name = group["name"]
@@ -201,8 +225,8 @@ class GaussianModel(nn.Module):
 
             # Mask internal state variables
             state = optim.state[group["params"][0]]
-            state["exp_avg"] = state["exp_avg"][~prune_mask, ...]
-            state["exp_avg_sq"] = state["exp_avg_sq"][~prune_mask, ...]
+            state["exp_avg"] = state["exp_avg"][~mask, ...]
+            state["exp_avg_sq"] = state["exp_avg_sq"][~mask, ...]
 
             # Concatenate interval state variables
             new_exp_avg = torch.zeros_like(new_param)
@@ -215,9 +239,81 @@ class GaussianModel(nn.Module):
             group["params"][0] = Parameter(param)
             optim.state[group["params"][0]] = state
             setattr(self, name, group["params"][0])
+        self.means_grad_accum = self.means_grad_accum[~mask]
 
-        # Reset accumulated gradients
-        self.means_grad_accum = torch.zeros(self.means.shape[0], device=self.device)
+    ###-------- Surface regularization ---------------------------------------
+    ### - Implementation of eqs. (1) and (5) from https://arxiv.org/abs/2311.12775
+
+    def covariance(self):
+        R = quat_to_rot_tensor(self.quats)
+        S_2 = torch.exp(self.scales).pow(2).unsqueeze(2)
+        sigma = R @ (R.transpose(-2, -1) * S_2)
+        try:
+            sigma_inv = sigma.inverse()
+        except:
+            sigma_inv = sigma.pinverse()
+        return sigma_inv
+
+    def density_function(self, points, update_neighbors=True):
+        # Get the closest Gaussians to each point
+        if update_neighbors or not hasattr(self, 'knn_idxs'):
+            self.knn_idxs = knn_points(points[None], self.means[None], K=16).idx[0]
+        neighbor_idxs = self.knn_idxs
+
+        # Compute the density function d as a sum of the opacity-weighted sampled point values
+        mu_g = self.means[neighbor_idxs]
+        mu = points[:, None] - mu_g
+        mu = mu[:,:,None,:]
+        sigma_inv = self.covariance()[neighbor_idxs]
+        out = torch.matmul(mu, sigma_inv)
+        out = (out * mu).sum(-1)
+        out = out.clamp(min=0, max=1e8)
+        d = torch.exp(-0.5 * out).squeeze()
+        d = torch.sum(d * torch.sigmoid(self.opacities[neighbor_idxs].squeeze()), dim=-1)
+        d[d > 1] = 1 + 1e-12
+        return d, neighbor_idxs
+
+    def approximate_density_function(self, points, depth, camera, beta, znear=0.001):
+        # Transform points to camera space
+        view_mat = camera.view_matrix.to(self.device)
+        ones = torch.ones(points.shape[0], 1).to(self.device)
+        points = torch.cat((points, ones), dim=1)
+        points = torch.matmul(view_mat, points.t()).t()
+        z = points[:, 2]
+        mask = z > znear
+
+        # Project points to image space
+        depth = depth.unsqueeze(0).unsqueeze(0)
+        proj_mat = camera.proj_matrix.to(self.device)
+        points_proj = torch.matmul(proj_mat, points.t()).t()[:,:2].unsqueeze(0).unsqueeze(2)
+        factor = -1 * min(camera.height, camera.width)
+        points_proj[..., 0] = factor / camera.width * points_proj[..., 0]
+        points_proj[..., 1] = factor / camera.height * points_proj[..., 1]
+
+        # Find the corresponding rendered depth values
+        z_map = torch.nn.functional.grid_sample(
+            input=depth,
+            grid=points_proj,
+            mode='bilinear',
+            padding_mode='border'
+        )[0, 0, :, 0]
+        
+        # Compute the estimated density from the estimated SDF
+        sdf_estimate = z_map[mask] - z[mask]
+        d_estimate = torch.exp(-0.5 * sdf_estimate.pow(2) / beta[mask].pow(2))
+        return d_estimate, mask
+
+    def sample_points(self, num_samples):
+        scales = torch.exp(self.scales)
+        areas = torch.prod(scales, dim=-1).abs()
+        probs = areas.cumsum(dim=-1) / torch.sum(areas, dim=-1, keepdim=True)
+        idxs = torch.multinomial(probs, num_samples, replacement=True)
+        xi = torch.randn_like(self.means[idxs]) * scales[idxs]
+        xi = torch.bmm(quat_to_rot_tensor(self.quats[idxs]), xi[..., None]).squeeze()
+        xi = self.means[idxs] + xi
+        return xi, idxs
+
+    ###-------- Model export ----------------------------------
 
     def export_ply(self, filepath):
         # Build data type
@@ -254,6 +350,173 @@ class GaussianModel(nn.Module):
 
     def export_splat(self, filepath):
         raise NotImplementedError
+
+    def export_mesh(self, filepath, algorithm, **kwargs):
+        import open3d as o3d
+
+        if algorithm == 'marching_cubes':
+            mesh = self.extract_mesh_marching_cubes(filepath)
+        elif algorithm == 'poisson':
+            mesh = self.extract_mesh_poisson(kwargs['scene'], kwargs['cameras'])
+        else:
+            raise ValueError('Unknown mesh extraction algorithm: {}'.format(algorithm))
+
+        # Decimate mesh
+        logging.debug("Decimating mesh")
+        decimation_target = 250_000
+        decimated_mesh = mesh.simplify_quadric_decimation(decimation_target)
+
+        # Clean mesh
+        logging.debug("Cleaning mesh")
+        decimated_mesh.remove_degenerate_triangles()
+        decimated_mesh.remove_duplicated_triangles()
+        decimated_mesh.remove_duplicated_vertices()
+        decimated_mesh.remove_non_manifold_edges()
+
+        # Save mesh
+        o3d.io.write_triangle_mesh(
+            filepath,
+            decimated_mesh,
+            write_triangle_uvs=True,
+            write_vertex_colors=False,
+            write_vertex_normals=True)
+
+    ###-------- Mesh extraction ---------------------------------------
+
+    def extract_mesh_poisson(self, scene, cameras, **kwargs):
+        import open3d as o3d
+
+        # Compute level surface points for each camera
+        surface_level = 0.3
+        num_total_points = 2_000_000
+        num_points_per_camera = num_total_points // len(cameras)
+
+        self.background = torch.zeros(3, device=self.device)
+
+        p_intersects = []
+        for cam in tqdm(cameras):
+            with torch.no_grad():
+                # Render depth
+                _, extras = scene.render(cam)
+                depth = extras['depth']
+
+                # Backproject depth to 3D points
+                idxs = torch.randperm(depth.reshape(-1).shape[0])[:num_points_per_camera]
+                y, x = torch.meshgrid(torch.arange(cam.width), torch.arange(cam.height))
+                x = x.reshape(-1)[idxs].to(self.device)
+                y = y.reshape(-1)[idxs].to(self.device)
+                depth = depth.reshape(-1)[idxs]
+                p_3d = torch.stack([x, y, depth], dim=-1)
+                p_world = cam.backproject_points(p_3d)
+
+                # Find closest Gaussians to each point
+                neighbor_idxs = knn_points(p_world[None], self.means[None], K=16).idx[0]
+                
+                # Prepare samples
+                p_std = torch.exp(self.scales)[neighbor_idxs[:,0]].norm(dim=-1)
+                p_range = torch.linspace(-3, 3, 21).to(self.device)[None, :, None]
+                p_range = p_range * p_std[..., None, None].expand(-1, 21, 1)
+                p_norm = torch.nn.functional.normalize(p_world - torch.as_tensor(cam.position, device=self.device), dim=-1)
+                samples = p_world[:,None,:] + p_range * p_norm[:,None,:]
+                samples = samples.view(-1, 3).float()
+                
+                # Compute density of samples
+                d, _ = self.density_function(samples)
+                d = d.reshape(-1, 21)
+                
+                # Retain densities above threshold
+                under = (d - surface_level) < 0
+                above = (d - surface_level) > 0
+                _, first_d_above_idx = above.max(dim=-1, keepdim=True)
+                empty_pix = ~under[..., 0] + (first_d_above_idx[..., 0] == 0)
+                d = d[~empty_pix]
+                p_range = p_range[~empty_pix][..., 0]
+                
+                # Compute densities and range before and after surface crossing
+                idx = first_d_above_idx[~empty_pix]
+                d_before = d.gather(dim=-1, index=idx-1).view(-1)
+                t_before = p_range.gather(dim=-1, index=idx-1).view(-1)
+                first_d_above = d.gather(dim=-1, index=idx).view(-1)
+                first_t_above = p_range.gather(dim=-1, index=idx).view(-1)
+
+                # Compute surface intersection point
+                t_intersect = (surface_level - d_before) / \
+                              (first_d_above - d_before) * \
+                              (first_t_above - t_before) + \
+                              t_before
+                p_intersect = (p_world[~empty_pix] + t_intersect[:, None] * p_norm[~empty_pix])
+                p_intersects.append(p_intersect)
+            
+        # Construct point cloud from level surface points
+        p_intersects = torch.cat(p_intersects)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(p_intersects.double().cpu().numpy())
+        pcd.estimate_normals()
+
+        # Remove outliers
+        cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=20.)
+        pcd = pcd.select_by_index(ind)
+
+        # Compute mesh
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=kwargs.get('poisson_depth', 9))
+
+        # Remove low density vertices
+        verts = densities < np.quantile(densities, 0.1)
+        mesh.remove_vertices_by_mask(verts)
+
+        return mesh #, p_worlds
+
+    def extract_mesh_marching_cubes(self):
+        import itertools
+        import mcubes
+        import open3d as o3d
+        from pytorch3d.io import save_obj
+
+        # Surface 
+        surface_level = 1
+        resolution = 256
+        radius = 10 # TODO: Compute extent of the scene 
+        X = torch.linspace(-1, 1, resolution) * radius
+        Y = torch.linspace(-1, 1, resolution) * radius
+        Z = torch.linspace(-1, 1, resolution) * radius
+        xx, yy, zz = torch.meshgrid(X, Y, Z)
+        P = torch.stack((xx, yy, zz), dim=-1).view(-1, 3).to(self.device)
+
+        # Compute density for every combination of xx, yy, and zz
+        logging.debug("Computing density")
+        N = 2_000_000
+        D = torch.zeros(resolution**3).to(self.device)
+        max_dist = np.sqrt(2*(((radius * 2) / resolution)**2))
+        for i in range(0, P.shape[0], N):
+            D[i:i+N] = self._density(P[i:i+N], max_dist)
+        D = D.reshape(resolution, resolution, resolution)
+
+        # Compute the mesh for the given isosurface
+        logging.debug("Computing mesh")
+        vertices, triangles = mcubes.marching_cubes(D.cpu().numpy(), surface_level)
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(vertices)
+        mesh.triangles = o3d.utility.Vector3iVector(triangles)
+        mesh.compute_vertex_normals()
+
+        return mesh
+
+    # TODO: Remove this function in favor of 'density_function' ?
+    def _density(self, points, max_dist):
+        neighbor_idxs = knn_points(points[None], self.means[None], K=16).idx[0]
+        neighbor_means = self.means[neighbor_idxs].detach().squeeze()
+        neighbor_opacity = torch.clone(self.opacities[neighbor_idxs]).detach().squeeze()
+
+        # Zero out opacities of neighbors that are too far
+        dists = torch.norm(points[:,None] - neighbor_means, dim=-1)
+        idxs = dists > (max_dist * 10)
+        neighbor_opacity[idxs] = 0
+
+        # Compute density
+        density = torch.sum(neighbor_opacity, dim=-1)
+
+        return density
 
 class GaussianDistribution:
     def __init__(self, model, mask):

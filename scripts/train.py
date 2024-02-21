@@ -26,18 +26,27 @@ async def train(
     metrics = Metrics(model, scene, args)
     optimizer = optim.Adam(model.parameters())
 
+    # Schedulers
+    regularize_depth_schedule = Scheduler(
+        args.regularize_depth,
+        args.regularize_depth_start,
+        args.regularize_depth_end)
+    regularize_opacity_schedule = Scheduler(
+        args.regularize_opacity,
+        args.regularize_opacity_start,
+        args.regularize_opacity_end)
+    regularize_density_schedule = Scheduler(
+        args.regularize_density,
+        args.regularize_density_start,
+        args.regularize_density_end)
+
     # Checkpoint filepath
     timestamp = datetime.now().strftime('%Y_%m_%d-%H_%M_%S')
 
-    for step in tqdm(range(1, args.max_iter)):
-        # TODO: Rescale scene at desired steps
-        #if step == 0:   scene.rescale(0.25)
-        #if step == 250: scene.rescale(2)
-        #if step == 500: scene.rescale(2)
-
+    for step in tqdm(range(1, args.max_iter + 1)):
         # 1. Update the learning rate of the gaussians
         # 2. Every N iterations, increase the spherical harmonic degree by one
-        model.update_learning_rate(optimizer, step)
+        model.update_learning_rate(step, optimizer)
         if step % args.sh_increment_interval == 0:
             model.increment_sh_degree()
         model.background = torch.rand(3, device=device)
@@ -47,19 +56,35 @@ async def train(
         rendered_image, extras = scene.render(camera)
 
         # 4. Compute the loss between the rendered image and the ground truth
-        dims = None #(camera.width, camera.height)
-        ground_truth_image = camera.get_original_image(dims).float()
+        ground_truth_image = camera.get_original_image().float()
         loss_l1 = (rendered_image - ground_truth_image).abs().mean()
         loss_ssim = 1 - model.ssim(
             rendered_image.permute(2, 0, 1).unsqueeze(0),
             ground_truth_image.permute(2, 0, 1).unsqueeze(0))
         loss = (1 - args.lambda_dssim) * loss_l1 + args.lambda_dssim * loss_ssim
 
-        if args.regularize_depth:
+        if regularize_depth_schedule(step):
             estimated_depth = torch.as_tensor(camera.get_estimated_depth()).float().to(device)
             rendered_depth = extras['depth']
             loss_depth = (rendered_depth - estimated_depth).abs().mean()
             loss += args.lambda_depth * loss_depth
+
+        if regularize_opacity_schedule(step):
+            opacities = torch.sigmoid(model.opacities)
+            loss_opacity = -(opacities * torch.log(opacities + 1e-10) + \
+                           (1 - opacities) * torch.log(1 - opacities + 1e-10)).mean()
+            loss += args.lambda_opacity * loss_opacity
+
+        if regularize_density_schedule(step):
+            update = (step == regularize_density_schedule.start or step % args.interval_densify == 1)
+            if update:
+                model.points, _ = model.sample_points(num_samples=100_000)
+            p = model.points.detach()
+            density, neighbor_idxs = model.density_function(p, update_neighbors=update)
+            beta = torch.exp(model.scales).min(dim=-1)[0][neighbor_idxs].mean(dim=1)
+            approx_density, mask = model.approximate_density_function(p, extras['depth'], camera, beta)
+            loss_density = (density[mask] - approx_density).abs().mean()
+            loss += args.lambda_density * loss_density
 
         # 5. Backpropagate the loss
         loss.backward()
@@ -71,6 +96,9 @@ async def train(
         with torch.no_grad():
             model.update_grad_accum(step, extras)
             model.densify_and_prune(step, optimizer, extras)
+            if regularize_density_schedule.start == step:
+                opacity_mask = (torch.sigmoid(model.opacities) < 0.5).squeeze()
+                model.update_state(optimizer, opacity_mask)
         optimizer.zero_grad(set_to_none=True)
 
         # Record and display metrics
@@ -80,6 +108,10 @@ async def train(
         metrics.update(step, 'Loss (dssim)', loss_ssim.detach().cpu().numpy())
         if args.regularize_depth:
             metrics.update(step, 'Loss (depth)', loss_depth.detach().cpu().numpy())
+        if regularize_opacity_schedule(step):
+            metrics.update(step, 'Loss (opacity)', loss_opacity.detach().cpu().numpy())
+        if regularize_density_schedule(step):
+            metrics.update(step, 'Loss (density)', loss_density.detach().cpu().numpy())
         metrics.log(step)
 
         # 8. Every M iterations, save checkpoint (the filename should be the current date + step
@@ -111,6 +143,16 @@ class Metrics():
             str_out += f"{key}: {row_mean:<10.4f} | "
         str_out += f"N: {self.model.means.shape[0]:<10}"
         tqdm.write(str_out)
+
+
+class Scheduler():
+    def __init__(self, active, start, stop):
+        self.active = active
+        self.start = start
+        self.stop = stop
+
+    def __call__(self, step):
+        return self.active and self.start <= step < self.stop
 
 
 def arg_parser():
@@ -147,12 +189,13 @@ def arg_parser():
     parser_lr.add_argument('--lr-opacities', type=float, default=0.05)
 
     # Regularization
-    # TODO: Add schedulers (for depth, in particular)
-    parser_lambda = parser.add_argument_group('Regularization')
-    parser_lambda.add_argument('--regularize-depth', action=BooleanOptionalAction)
+    # TODO: Add learning rate schedulers
+    parser_lambda = parser.add_argument_group('Regularization weights')
     parser_lambda.add_argument('--lambda-dssim', type=float, default=0.2)
     parser_lambda.add_argument('--lambda-depth', type=float, default=0.2)
     parser_lambda.add_argument('--lambda-smooth', type=float, default=0.2)
+    parser_lambda.add_argument('--lambda-opacity', type=float, default=0.2)
+    parser_lambda.add_argument('--lambda-density', type=float, default=0.2)
 
     # Gaussian densification
     parser_densify = parser.add_argument_group('Gaussian densification')
@@ -160,15 +203,39 @@ def arg_parser():
     parser_densify.add_argument('--warmup-grad', type=int, default=500)
     parser_densify.add_argument('--interval-densify', type=int, default=100)
     parser_densify.add_argument('--interval-opacity-reset', type=int, default=3000)
+    parser_densify.add_argument('--densify-end', type=int, default=30000)
     parser_densify.add_argument('--epsilon-alpha', type=float, default=0.005)
     parser_densify.add_argument('--tau-means', type=float, default=0.0002)
     parser_densify.add_argument('--densify-scale-thresh', type=float, default=0.01)
     parser_densify.add_argument('--phi', type=float, default=1.6)
 
+    # Semantic segmentation
+    parser_semantic = parser.add_argument_group('Semantic segmentation')
+    parser_semantic.add_argument('--semantic-path', type=str, default='semantic')
+    parser_semantic.add_argument('--semantic-model', type=str, default='facebook/mask2former-swin-large-ade-semantic')
+
     # Depth estimation
-    parser_depth = parser.add_argument_group('Depth estimation')
-    parser_depth.add_argument('--depths-path', type=str, default='depths')
-    parser_depth.add_argument('--depth-model', type=str, default='zoe')
+    parser_depth_estimate = parser.add_argument_group('Depth estimation')
+    parser_depth_estimate.add_argument('--depths-path', type=str, default='depths')
+    parser_depth_estimate.add_argument('--depth-model', type=str, default='zoe')
+
+    # Depth regularization
+    parser_depth = parser.add_argument_group('Depth regularization')
+    parser_depth.add_argument('--regularize-depth', action=BooleanOptionalAction)
+    parser_depth.add_argument('--regularize-depth-start', type=int, default=1)
+    parser_depth.add_argument('--regularize-depth-end', type=int, default=15000)
+
+    # Opacity entropy regularization (useful for mesh reconstruction)
+    parser_entropy = parser.add_argument_group('Opacity regularization')
+    parser_entropy.add_argument('--regularize-opacity', action=BooleanOptionalAction)
+    parser_entropy.add_argument('--regularize-opacity-start', type=int, default=7000)
+    parser_entropy.add_argument('--regularize-opacity-end', type=int, default=9000)
+
+    # Density regularization (useful for mesh reconstruction)
+    parser_surface = parser.add_argument_group('SuGaR density regularization')
+    parser_surface.add_argument('--regularize-density', action=BooleanOptionalAction)
+    parser_surface.add_argument('--regularize-density-start', type=int, default=9000)
+    parser_surface.add_argument('--regularize-density-end', type=int, default=15000)
 
     return parser
 
@@ -202,6 +269,7 @@ async def main():
             **vars(args)).to(device)
     rasterizer = GaussianRasterizer(model, dataset.cameras)
     scene = Scene(dataset.cameras, model, rasterizer)
+    model.interval_densify = len(scene.cameras)
 
     if args.viewer:
         # It would be nice to move the viewer to a separate process in the future

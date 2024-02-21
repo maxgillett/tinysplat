@@ -1,4 +1,4 @@
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import math
 import asyncio
 import uuid
@@ -108,6 +108,59 @@ class Camera:
             img = img.permute(1, 2, 0)
         return img
 
+    def project_points(self, points: Tensor, screen_coordinates=True, return_depth=False) -> Tensor:
+        """Project points in world coordinates to screen or camera coordinates."""
+        assert points.shape[1] == 3
+        view_mat = self.view_matrix.to(self.device)
+        proj_mat = self.proj_matrix.to(self.device)
+        points = points @ view_mat[:3, :3].T + view_mat[:3, 3]
+        points = torch.cat([points, torch.ones(points.shape[0])[...,None].to(self.device)], dim=1)
+        points = points @ proj_mat[:, :].T
+
+        if return_depth:
+            points[:,:2] = points[:,:2] / points[:, 3].unsqueeze(1)
+        else:
+            points = points / points[:, 3].unsqueeze(1)
+        points = points[:,:3]
+
+        # Convert X and Y to screen coordinates from NDC coordinates
+        if screen_coordinates:
+            c_x = self.width // 2
+            c_y = self.height // 2
+            points[:,0] = (0.5 * self.height * points[:,0]) - 0.5 + c_x
+            points[:,1] = 0.5 * self.width * points[:,1] - 0.5 + c_y
+
+        return points
+
+    def backproject_points(self, points: Tensor, scale_depth=True, screen_coordinates=True) -> Tensor:
+        """Backproject points in screen or camera coordinates to world coordinates."""
+        assert points.shape[1] == 3
+        view_mat = self.view_matrix
+        proj_mat = self.proj_matrix
+        full_mat_inv = (proj_mat @ view_mat).inverse().to(self.device)
+
+        if scale_depth or screen_coordinates:
+            points = points.clone()
+
+        # If depth is in camera Z-coordinates, use projection matrix to convert to NDC Z-coordinates
+        if scale_depth:
+            f1 = self.proj_matrix[2,2]
+            f2 = self.proj_matrix[2,3]
+            points[:,2] = (f1 * points[:,2] + f2) / points[:,2]
+
+        # If X and Y are screen coordinates, transform to NDC coordinates
+        if screen_coordinates:
+            c_x = self.width // 2
+            c_y = self.height // 2
+            points[:,0] = (points[:,0] + 0.5 - c_x) / self.height * 2
+            points[:,1] = (points[:,1] + 0.5 - c_y) / self.width * 2
+
+        points = torch.cat([points, torch.ones(points.shape[0], 1, device=self.device)], dim=1)
+        points = torch.matmul(points, full_mat_inv.T)
+        points = points / points[:,3][..., None]
+        points = points[:,:3]
+        return points
+
     def get_estimated_depth(self) -> Tensor:
         return self.estimated_depth
 
@@ -136,7 +189,7 @@ class Scene:
         for camera in self.cameras:
             camera.rescale(factor)
 
-    def render(self, camera: Camera, dims: Tuple[int, int] = None) -> Tensor:
+    def render(self, camera: Camera, dims: Tuple[int, int] = None) -> (Tensor, Dict):
         return self.rasterizer(camera, dims, self.model.active_sh_degree)
 
 

@@ -62,12 +62,12 @@ class Viewer:
             client.camera = camera
 
             # Widen FOV
-            cam = client.camera
-            f_x = cam.f_x = cam.f_x / 2
-            f_y = cam.f_y = cam.f_y / 2
-            fov_x = cam.fov_x = 2 * np.arctan(cam.width / (2 * f_x))
-            fov_y = cam_fov_y = 2 * np.arctan(cam.height / (2 * f_y))
-            cam.update_proj_matrix(fov_x, fov_y)
+            #cam = client.camera
+            #f_x = cam.f_x = cam.f_x / 2
+            #f_y = cam.f_y = cam.f_y / 2
+            #fov_x = cam.fov_x = 2 * np.arctan(cam.width / (2 * f_x))
+            #fov_y = cam_fov_y = 2 * np.arctan(cam.height / (2 * f_y))
+            #cam.update_proj_matrix(fov_x, fov_y)
 
             await self.async_queue.put((client, msg))
         elif msg["type"] == "renderRequest":

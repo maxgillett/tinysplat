@@ -12,6 +12,7 @@ def main():
 
     parser = ArgumentParser(description='Configuration parameters')
     parser.add_argument('--filetype', type=str, default='PLY')
+    parser.add_argument('--mesh-extraction-algorithm', type=str, default='poisson')
     parser.add_argument('input_file', type=str)
     parser.add_argument('output_file', type=str)
     args = parser.parse_args()
@@ -20,11 +21,13 @@ def main():
     state_dict = torch.load(args.input_file)
     model = GaussianModel.from_state_checkpoint(state_dict)
 
-    # Export model to PLY or SPLAT
+    # Export model to PLY, SPLAT, or OBJ
     if args.filetype == 'PLY':
         model.export_ply(args.output_file)
     elif args.filetype == 'SPLAT':
         model.export_splat(args.output_file)
+    elif args.file_type == "OBJ":
+        model.export_mash(args.output_file, args.mesh_extraction_algorithm)
     else:
         raise ValueError('Unknown filetype: {}'.format(args.filetype))
 

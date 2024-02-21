@@ -38,11 +38,17 @@ class GaussianRasterizer:
         rgbs = spherical_harmonics(*inputs)
         rgbs = torch.clamp(rgbs + 0.5, min=0.0)
 
-        # 3. Rasterize
+        # 3. Rasterize rgbs
         inputs = self.rasterize_forward_inputs(
             xys, depths, radii, conics, num_tiles, rgbs, dims)
-        rgbs, depths = rasterize_gaussians(*inputs)
+        rgbs, _ = rasterize_gaussians(*inputs)
         rgbs = torch.clamp(rgbs, max=1.0)
+
+        # 4. Rasterize depths
+        inputs = self.rasterize_forward_inputs(
+            xys, depths, radii, conics, num_tiles, depths[:, None].repeat(1, 3), dims)
+        depths, _ = rasterize_gaussians(*inputs)
+        depths = depths[:,:,0]
 
         extras = {
             "depth": depths,
