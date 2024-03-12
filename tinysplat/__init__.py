@@ -1,5 +1,5 @@
 from .dataset import Dataset
 from .scene import Camera, PointCloud, Scene
-from .model import GaussianModel
-from .rasterize import GaussianRasterizer
+from .splatting.model_gaussian import GaussianModel
+from .splatting.rasterize import GaussianRasterizer
 from .depth import DepthEstimator

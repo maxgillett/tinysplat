@@ -38,7 +38,6 @@ def quat_to_rot_matrix(quat):
     ])
     return R
 
-
 # Taken from gsplat
 def quat_to_rot_tensor(quat: Tensor) -> Tensor:
     assert quat.shape[-1] == 4, quat.shape
@@ -72,3 +71,36 @@ def quat_to_rot_tensor(quat: Tensor) -> Tensor:
         ],
         dim=-2,
     )
+
+## Modified from PixelNeRF (https://www.github.com/sxyu/pixel-nerf)
+def unproj_map(width, height, f, c=None, device="cpu"):
+    """
+    Get camera unprojection map for given image size.
+    [y,x] of output tensor will contain unit vector of camera ray of that pixel.
+    :param width image width
+    :param height image height
+    :param f focal length, either a number or tensor [fx, fy]
+    :param c principal point, optional, either None or tensor [fx, fy]
+    if not specified uses center of image
+    :return unproj map (height, width, 3)
+    """
+    if c is None:
+        c = [width * 0.5, height * 0.5]
+    else:
+        c = c.squeeze()
+    if isinstance(f, float):
+        f = [f, f]
+    elif len(f.shape) == 0:
+        f = f[None].expand(2)
+    elif len(f.shape) == 1:
+        f = f.expand(2)
+    Y, X = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32) - float(c[1]),
+        torch.arange(width, dtype=torch.float32) - float(c[0]),
+    )
+    X = X.to(device=device) / float(f[0])
+    Y = Y.to(device=device) / float(f[1])
+    Z = torch.ones_like(X)
+    unproj = torch.stack((-X, -Y, -Z), dim=-1)
+    unproj /= torch.norm(unproj, dim=-1).unsqueeze(-1)
+    return unproj

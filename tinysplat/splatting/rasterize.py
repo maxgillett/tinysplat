@@ -7,8 +7,8 @@ import torch
 from torch import nn
 from torch import device
 
-from .scene import Camera
-from .model import GaussianModel
+from .model_gaussian import GaussianModel
+from ..scene import Camera
 
 class GaussianRasterizer:
     def __init__(self,

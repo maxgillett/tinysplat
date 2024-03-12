@@ -15,8 +15,8 @@ from gsplat.sh import num_sh_bases, deg_from_sh
 from plyfile import PlyData, PlyElement
 from pytorch3d.ops import knn_points, ball_query
 
-from .scene import PointCloud
-from .utils import random_quat_tensor, quat_to_rot_tensor, RGB2SH, SH2RGB
+from ..scene import PointCloud
+from ..utils import random_quat_tensor, quat_to_rot_tensor, RGB2SH, SH2RGB
 
 class GaussianModel(nn.Module):
     def __init__(self,
@@ -273,7 +273,7 @@ class GaussianModel(nn.Module):
         d[d > 1] = 1 + 1e-12
         return d, neighbor_idxs
 
-    def approximate_density_function(self, points, depth, camera, beta, znear=0.001):
+    def approximate_density_function(self, points, depth, camera, beta, znear=0.001, return_sdf=False):
         # Transform points to camera space
         view_mat = camera.view_matrix.to(self.device)
         ones = torch.ones(points.shape[0], 1).to(self.device)
@@ -285,12 +285,20 @@ class GaussianModel(nn.Module):
         # Project points to image space
         depth = depth.unsqueeze(0).unsqueeze(0)
         proj_mat = camera.proj_matrix.to(self.device)
-        points_proj = torch.matmul(proj_mat, points.t()).t()[:,:2].unsqueeze(0).unsqueeze(2)
-        factor = -1 * min(camera.height, camera.width)
-        points_proj[..., 0] = factor / camera.width * points_proj[..., 0]
-        points_proj[..., 1] = factor / camera.height * points_proj[..., 1]
+        points_proj = torch.matmul(proj_mat, points.t()).t()[:,:2]
+        points_proj[..., 0] = -camera.width * points_proj[..., 0]
+        points_proj[..., 1] = -camera.height * points_proj[..., 1]
+
+        # Mask the visible region
+        x = points_proj[:, 0]
+        y = points_proj[:, 1]
+        mask &= -camera.width < x
+        mask &= x <= 0
+        mask &= -camera.height < y
+        mask &= y <= 0
 
         # Find the corresponding rendered depth values
+        points_proj = points_proj.unsqueeze(0).unsqueeze(2)
         z_map = torch.nn.functional.grid_sample(
             input=depth,
             grid=points_proj,
@@ -298,10 +306,14 @@ class GaussianModel(nn.Module):
             padding_mode='border'
         )[0, 0, :, 0]
         
-        # Compute the estimated density from the estimated SDF
         sdf_estimate = z_map[mask] - z[mask]
-        d_estimate = torch.exp(-0.5 * sdf_estimate.pow(2) / beta[mask].pow(2))
-        return d_estimate, mask
+        if return_sdf:
+            # Compute the estimated SDF
+            return sdf_estimate
+        else:
+            # Compute the estimated density from the estimated SDF
+            d_estimate = torch.exp(-0.5 * sdf_estimate.pow(2) / beta[mask].pow(2))
+            return d_estimate, mask
 
     def sample_points(self, num_samples):
         scales = torch.exp(self.scales)

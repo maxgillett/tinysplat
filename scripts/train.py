@@ -10,10 +10,9 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 import numpy as np
 from tqdm import tqdm
 
+from tinysplat import GaussianModel, GaussianRasterizer
 from tinysplat.dataset import Dataset
 from tinysplat.depth import DepthEstimator
-from tinysplat.model import GaussianModel
-from tinysplat.rasterize import GaussianRasterizer
 from tinysplat.scene import Scene
 from tinysplat.viewer import Viewer
 
@@ -79,15 +78,20 @@ async def train(
             update = (step == regularize_density_schedule.start or step % args.interval_densify == 1)
             if update:
                 model.points, _ = model.sample_points(num_samples=100_000)
-            p = model.points.detach()
-            density, neighbor_idxs = model.density_function(p, update_neighbors=update)
+            points = model.points
+            density, neighbor_idxs = model.density_function(points, update_neighbors=update)
             beta = torch.exp(model.scales).min(dim=-1)[0][neighbor_idxs].mean(dim=1)
-            approx_density, mask = model.approximate_density_function(p, extras['depth'], camera, beta)
-            loss_density = (density[mask] - approx_density).abs().mean()
+            approx_val, mask = model.approximate_density_function(
+                points, extras['depth'], camera, beta, return_sdf=args.regularize_sdf)
+            if args.regularize_sdf:
+                sdf = beta * torch.sqrt(-2 * torch.log(density.clamp(0.001, 0.999)))
+                loss_density = (sdf[mask] - approx_val).abs().mean()
+            else:
+                loss_density = (density[mask] - approx_val).abs().mean()
             loss += args.lambda_density * loss_density
 
         # 5. Backpropagate the loss
-        loss.backward()
+        loss.backward(retain_graph=True)
 
         # 6. Perform optimization step
         optimizer.step()
@@ -234,6 +238,7 @@ def arg_parser():
     # Density regularization (useful for mesh reconstruction)
     parser_surface = parser.add_argument_group('SuGaR density regularization')
     parser_surface.add_argument('--regularize-density', action=BooleanOptionalAction)
+    parser_surface.add_argument('--regularize-sdf', action=BooleanOptionalAction)
     parser_surface.add_argument('--regularize-density-start', type=int, default=9000)
     parser_surface.add_argument('--regularize-density-end', type=int, default=15000)
 

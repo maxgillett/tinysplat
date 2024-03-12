@@ -1,4 +1,4 @@
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Union
 import math
 import asyncio
 import uuid
@@ -12,9 +12,16 @@ import torchvision.transforms.functional as TF
 from .utils import quat_to_rot_matrix
 
 class LazyTensorImage:
-    def __init__(self, pil_image, device="cuda:0"):
-        self.pil_image = pil_image
-        self.tensor = None
+    def __init__(self, image, device="cuda:0"):
+        # TODO: We should explicity check the range of values here, and 
+        # switch to accept only those within [-1, 1]
+        if isinstance(image, Tensor):
+            self.tensor = image / 255
+        elif isinstance(image, Image.Image):
+            self.pil_image = image
+            self.tensor = None
+        else:
+            raise TypeError("Image needs to be either a Tensor or PIL image")
         self.device = device
 
     def to_tensor(self):
@@ -22,6 +29,21 @@ class LazyTensorImage:
             arr = np.array(self.pil_image)
             self.tensor = torch.tensor(arr) / 255
         return self.tensor
+
+    @property
+    def height(self):
+        if self.tensor is not None:
+            return self.tensor.shape[0]
+        if self.pil_image is not None:
+            return self.pil_image.height
+
+    @property
+    def width(self):
+        if self.tensor is not None:
+            return self.tensor.shape[1]
+        if self.pil_image is not None:
+            return self.pil_image.width
+
 
 
 class Camera:
@@ -38,7 +60,7 @@ class Camera:
         near: Optional[float] = None,
         far: Optional[float] = None,
         visible_point_ids: Optional[List[int]] = None,
-        image: Optional[Image.Image] = None,
+        image: Optional[Union[Image.Image, Tensor]] = None,
         name: Optional[str] = None,
         device = "cuda:0"
     ):
@@ -51,10 +73,12 @@ class Camera:
         self.f_y = f_y
         self.fov_x = fov_x
         self.fov_y = fov_y
-        self.width = image.width
-        self.height = image.height
+        self.z_near = near
+        self.z_far = far
         self.visible_point_ids = visible_point_ids
-        self.image = LazyTensorImage(image, device)
+        self.image = LazyTensorImage(image, device=device)
+        self.width = self.image.width
+        self.height = self.image.height
         self.estimated_depth = None
         self.name = name
 
@@ -65,6 +89,9 @@ class Camera:
             assert near is not None
             assert far is not None
             self.update_proj_matrix(fov_x, fov_y, near, far)
+        else:
+            # TODO: Set near and far from proj_matrix
+            pass
 
     def update_view_matrix(self, position: Tensor, quat):
         """
@@ -100,7 +127,7 @@ class Camera:
         self.fov_y = self.fov_y * factor
         self.update_proj_matrix(self.fov_x, self.fov_y)
 
-    def get_original_image(self, dims: Tuple[int, int] = None) -> Tensor:
+    def get_original_image(self, dims: Tuple[int, int] = None, pad=False) -> Tensor:
         """Get the original image from the camera."""
         img = self.image.to_tensor().to(self.device)
         if dims is not None:
@@ -108,7 +135,7 @@ class Camera:
             img = img.permute(1, 2, 0)
         return img
 
-    def project_points(self, points: Tensor, screen_coordinates=True, return_depth=False) -> Tensor:
+    def project_points(self, points: Tensor, screen_coordinates=True, return_depth=False, clip=False) -> Tensor:
         """Project points in world coordinates to screen or camera coordinates."""
         assert points.shape[1] == 3
         view_mat = self.view_matrix.to(self.device)
@@ -129,6 +156,9 @@ class Camera:
             c_y = self.height // 2
             points[:,0] = (0.5 * self.height * points[:,0]) - 0.5 + c_x
             points[:,1] = 0.5 * self.width * points[:,1] - 0.5 + c_y
+
+        if clip:
+            points = points[(points[:, 2] > self.near) & (points[:, 2] < self.far)]
 
         return points
 
