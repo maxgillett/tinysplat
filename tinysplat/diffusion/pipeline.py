@@ -19,6 +19,7 @@ from diffusers.utils import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.configuration_utils import FrozenDict
+from diffusers.image_processor import VaeImageProcessor
 
 from .model_diffusion import (
     FeatureVolumeEncoder,
@@ -175,6 +176,7 @@ class TinysplatDiffusionPipeline(DiffusionPipeline):
             feature_extractor=feature_extractor,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
         # self.model_mode = None
 
@@ -316,45 +318,38 @@ class TinysplatDiffusionPipeline(DiffusionPipeline):
             extra_step_kwargs["generator"] = generator
         return extra_step_kwargs
 
-    def prepare_latents(self, init_images, batch_size, height, width, dtype, device, generator, latents=None):
-        # If `init_images` is not None, then convert to latent and use this as a starting point
-        if init_images is not None:
-            latents = self.vae.encode(init_images.to(dtype)).latent_dist.sample()
-            latents = latents * self.vae.config.scaling_factor
-            return latents
-
-        shape = (batch_size, 4, height // self.vae_scale_factor, width // self.vae_scale_factor)
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-            )
-
-        if latents is None:
+    def prepare_latents(self, init_images, timestep, batch_size, height, width, dtype, device, generator):
+        # If initial images are not provided, use random noise
+        if init_images is None:
+            shape = (batch_size, 4, height // self.vae_scale_factor, width // self.vae_scale_factor)
             latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        else:
-            latents = latents.to(device)
+            latents = latents * self.scheduler.init_noise_sigma
+            return latents
+        
+        # TODO: Use 'image_processor' to preprocess image (we should support PIL images, not just tensors)
 
-        # Scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
+        latents = self.vae.encode(init_images.to(dtype)).latent_dist.sample()
+        latents = latents * self.vae.config.scaling_factor
+        noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=dtype)
+        latents = self.scheduler.add_noise(latents, noise, timestep)
         return latents
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
-        init_images: List[torch.FloatTensor] = None,
+        init_images: Optional[List[torch.FloatTensor]] = None,
         target_cameras: Union[List[Camera], Camera] = None,
         input_cameras: List[List[Camera]] = None,
         torch_dtype=torch.float32,
         height: Optional[int] = None,
         width: Optional[int] = None,
+        strength: int = 0.8,
         num_inference_steps: int = 50,
         guidance_scale: float = 3.0,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.FloatTensor] = None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         # TODO: Experiment with negative prompts?
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
@@ -377,6 +372,12 @@ class TinysplatDiffusionPipeline(DiffusionPipeline):
                 The height in pixels of the generated image.
             width (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
                 The width in pixels of the generated image.
+            strength (`float`, *optional*, defaults to 0.8):
+                Indicates extent to transform the reference `init_images`. Must be between 0 and 1. `init_images` is
+                used as a starting point and more noise is added the higher the `strength`. The number of denoising
+                steps depends on the amount of noise initially added. When `strength` is 1, added noise is maximum and
+                the denoising process runs for the full number of iterations specified in `num_inference_steps`. A value
+                of 1 essentially ignores `image`.
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the
                 expense of slower inference.
@@ -396,10 +397,6 @@ class TinysplatDiffusionPipeline(DiffusionPipeline):
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
                 One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
                 to make generation deterministic.
-            latents (`torch.FloatTensor`, *optional*):
-                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
-                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor will ge generated by sampling using the supplied random `generator`.
             prompt_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
                 provided, text embeddings will be generated from `prompt` input argument.
@@ -462,18 +459,25 @@ class TinysplatDiffusionPipeline(DiffusionPipeline):
 
         # 5. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+        t_start = max(num_inference_steps - init_timestep, 0)
+        timesteps = self.scheduler.timesteps[t_start * self.scheduler.order :]
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(t_start * self.scheduler.order)
+        num_inference_steps -= t_start
+        latent_timestep = timesteps[:1]
 
-        # 6. Prepare latent variables
+        # 6. Prepare image latent variables
+        init_images = torch.stack(init_images, dim=0)
         latents = self.prepare_latents(
             init_images, 
+            latent_timestep,
             batch_size,
             height,
             width,
             prompt_embeds.dtype,
             device,
             generator,
-            latents
         )
 
         # 7. Prepare feature latents from PixelNeRF volume encoder

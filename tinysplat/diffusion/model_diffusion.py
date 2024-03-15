@@ -1,5 +1,6 @@
 from typing import Dict, List, Optional
 import itertools
+import math
 
 import kornia
 import torch
@@ -226,18 +227,29 @@ class FeatureAggregator(ModelMixin, ConfigMixin):
         self,
         input_dim: int = 128,
         hidden_dim: int = 256,
+        code_len: int = 10,
     ):
         super().__init__()
-        self.input_dim = input_dim
-        output_dim = input_dim + 3
+        self.code_len = code_len
+
+        if code_len == 0:
+            input_dim_1 = input_dim * 4
+        else:
+            input_dim_1 = input_dim * (code_len*6 + 1)
+        hidden_dim_1 = hidden_dim
+        output_dim_1 = input_dim * 2
+
+        input_dim_2 = input_dim
+        hidden_dim_2 = hidden_dim
+        output_dim_2 = input_dim + 3
 
         # First MLP (to compute intermediate features and weights)
-        self.fc1 = nn.Linear(input_dim * 4, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, input_dim * 2)
+        self.fc1 = nn.Linear(input_dim_1, hidden_dim_1)
+        self.fc2 = nn.Linear(hidden_dim_1, output_dim_1)
 
         # Second MLP (to compute final features and RGB)
-        self.fc3 = nn.Linear(input_dim, hidden_dim)
-        self.fc4 = nn.Linear(hidden_dim, output_dim)
+        self.fc3 = nn.Linear(input_dim_2, hidden_dim_2)
+        self.fc4 = nn.Linear(hidden_dim_2, output_dim_2)
         self.silu = nn.SiLU()
         self.sigmoid = nn.Sigmoid()
 
@@ -253,16 +265,13 @@ class FeatureAggregator(ModelMixin, ConfigMixin):
           output: Output features + RGB tensor of shape (B, C+3, D, D).
         """
 
-        # TODO: Positionally encode XYZ
+        # Positionally encode XYZ
         B, N, C, D = features.shape[:4]
-        xyz = xyz.permute(2, 0, 1, 4, 5, 3)
-        x = xyz[0, ...].reshape(-1, C)
-        y = xyz[1, ...].reshape(-1, C)
-        z = xyz[2, ...].reshape(-1, C) # (B*N*D*D, C)
+        xyz_code = self.positional_encode(xyz, self.code_len)
 
         # Concatenate features and positionally-encoded coordinates
         features = features.permute(0, 1, 3, 4, 2).reshape(-1, C) # (B*N*D*D, C)
-        input_batch = torch.cat([features, x, y, z], dim=1)
+        input_batch = torch.cat([features, xyz_code], dim=1)
 
         # Process the input tensor using the first MLP
         h1 = self.fc1(input_batch)
@@ -281,10 +290,39 @@ class FeatureAggregator(ModelMixin, ConfigMixin):
         output = output.permute(0, 3, 1, 2)
         return output
 
+    def positional_encode(self, xyz, L=10):
+        """
+        Positionally encode the input tensor
+
+        Args:
+          xyz: Coordinates (B, N, 3, C, D, D)
+
+        Returns:
+          output: Positionally-encoded coordinates (B*N*3*D*D, C*L*6)
+        """
+        B, N, _, C, D, D = xyz.shape
+        xyz = xyz.permute(2, 0, 1, 4, 5, 3)
+        x = xyz[0, ...].reshape(-1, C)
+        y = xyz[1, ...].reshape(-1, C)
+        z = xyz[2, ...].reshape(-1, C)
+
+        if L == 0:
+            return torch.cat([x, y, z], dim=1).reshape(-1, C*3)
+        else:
+            def apply_sin_cos(tensor, L):
+                sin_components = [torch.sin(math.pow(2, i) * tensor * math.pi) for i in range(L)]
+                cos_components = [torch.cos(math.pow(2, i) * tensor * math.pi) for i in range(L)]
+                return torch.cat(sin_components + cos_components, dim=1)
+
+            x_sin_cos = apply_sin_cos(x, L)
+            y_sin_cos = apply_sin_cos(y, L)
+            z_sin_cos = apply_sin_cos(z, L)
+            return torch.cat([x_sin_cos, y_sin_cos, z_sin_cos], dim=1).reshape(-1, C*L*6)
+
 
 class EmbeddingMLP(ModelMixin, ConfigMixin):
     """
-    Fully-connected layer used to feed conditioned CLIP image embeddings into the cross-attention mechanism.
+    Fully-connected layer used to prepare conditioned CLIP image embeddings for the cross-attention mechanism.
     """
 
     @register_to_config
